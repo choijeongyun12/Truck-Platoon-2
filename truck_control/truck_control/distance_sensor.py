@@ -61,4 +61,4 @@ class DistanceSensor:
         return self.lidar_distance
 
 if __name__ == "__main__":
-    main()
+    pass

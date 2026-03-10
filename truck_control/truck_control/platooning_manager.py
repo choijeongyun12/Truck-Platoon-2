@@ -24,8 +24,10 @@ class PlatooningManager:
         self.lidar_pitch = 0.0
 
         # PID 제어 파라미터
-        self.target_distance = 12.0  # 목표 간격 (m)
-        self.safe_distance = 8.0     # 최소 안전 간격 (m) 이하이면 저속 혹은 정지
+        self.min_distance = 5.0      # 정지 시 최소 간격 (m)
+        self.time_gap = 0.8          # 시간 간격 (s)
+        self.target_distance = 12.0  # 동적 계산 전 기본값 (m)
+        self.safe_distance = 4.5     # 최소 안전 간격 (m) 이하이면 저속 혹은 정지
         self.kp = 0.3
         self.ki = 0.01
         self.kd = 1.8
@@ -46,8 +48,13 @@ class PlatooningManager:
         self.lidar_pitch = lidar_msg.pitch
         self.control_speed()
 
-    def update_distance(self, lidar_distance, emergency_stop=False):
+    def update_distance(self, lidar_distance, emergency_stop=False, ego_velocity=None,
+                        min_distance_override=None, time_gap_override=None):
         self.lidar_distance = lidar_distance
+        if ego_velocity is not None:
+            min_dist = self.min_distance if min_distance_override is None else float(min_distance_override)
+            time_gap = self.time_gap if time_gap_override is None else float(time_gap_override)
+            self.target_distance = max(min_dist, min_dist + time_gap * float(ego_velocity))
         self.control_speed(emergency_stop=emergency_stop)  # ✅ 전달값 그대로 사용
 
     def control_speed(self, emergency_stop=False):
@@ -55,7 +62,7 @@ class PlatooningManager:
         if emergency_stop:
             self.node.get_logger().info(f"[{self.namespace}] 비상 정지")
             throttle_msg = Float32()
-            throttle_msg.data = 0.0
+            throttle_msg.data = -1.0
             self.throttle_pub.publish(throttle_msg)
             return
         """

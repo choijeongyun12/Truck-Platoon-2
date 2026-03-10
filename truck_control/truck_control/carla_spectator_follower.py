@@ -16,15 +16,16 @@ class CarlaSpectatorFollower:
 
     def find_truck1_vehicle(self):
         """같은 type_id 차량 중 role_name이 'truck1'인 차량 찾기"""
+        target_role = 'truck1'
         actors = self.world.get_actors()
         vehicles = [actor for actor in actors if actor.type_id.startswith('vehicle.daf')]
-        truck1_vehicles = [v for v in vehicles if v.attributes.get('role_name') == 'truck2']
+        truck1_vehicles = [v for v in vehicles if v.attributes.get('role_name') == target_role]
 
         if truck1_vehicles:
             self.target_vehicle = truck1_vehicles[0]
-            print(f"\n 'truck1' 찾음: ID: {self.target_vehicle.id}, 모델: {self.target_vehicle.type_id}")
+            print(f"\n '{target_role}' 찾음: ID: {self.target_vehicle.id}, 모델: {self.target_vehicle.type_id}")
         else:
-            print("'truck1' 역할 차량을 찾지 못했습니다.")
+            print(f"'{target_role}' 역할 차량을 찾지 못했습니다.")
 
     def lerp(self, start, end, alpha):
         """선형 보간 (Lerp)"""

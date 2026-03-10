@@ -2,7 +2,7 @@ from std_msgs.msg import Float32
 
 def publish_commands(throttle_publishers, current_velocities, target_velocity, last_steering, emergency_stop=False):
     for truck_id in range(len(throttle_publishers)):
-        # Truck 0에 대해 emergency_stop인 경우, 무조건 0 throttle (또한 brake 명령도 함께 보낼 수 있다면)
+    # Truck 0에 대해 emergency_stop인 경우, 브레이크(-1.0) 명령
         if truck_id == 0 and emergency_stop:
             msg = Float32()
             msg.data = -1.0  # throttle 0
@@ -21,4 +21,4 @@ def publish_commands(throttle_publishers, current_velocities, target_velocity, l
         throttle_publishers[truck_id].publish(msg)
 
 if __name__ == '__main__':
-    main()
+    pass

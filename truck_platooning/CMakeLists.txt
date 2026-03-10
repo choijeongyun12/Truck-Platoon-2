@@ -10,6 +10,9 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -38,6 +41,9 @@ ament_target_dependencies(lane_following_node
   rclcpp
   std_msgs
   sensor_msgs
+  std_srvs
+  nav_msgs
+  geometry_msgs
   cv_bridge
   image_transport
 )
@@ -47,6 +53,11 @@ target_link_libraries(lane_following_node ${OpenCV_LIBS})
 # ───── Install Targets ─────
 install(TARGETS
   lane_following_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  src/carla_pose_publisher.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -1,0 +1,194 @@
+import signal
+import tkinter as tk
+from dataclasses import dataclass
+from typing import Dict
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32
+
+
+@dataclass
+class TruckEnergyState:
+    speed_ms: float = 0.0
+    soc: float = 0.0
+    power_w: float = 0.0
+    wh_per_km: float = 0.0
+
+
+class EnergySubscriber(Node):
+    def __init__(self, dashboard, truck_count: int):
+        super().__init__("energy_dashboard_subscriber")
+        self.dashboard = dashboard
+        self.truck_count = truck_count
+        self.states: Dict[int, TruckEnergyState] = {i: TruckEnergyState() for i in range(self.truck_count)}
+
+        for truck_id in range(self.truck_count):
+            self.create_subscription(
+                Float32, f"/truck{truck_id}/velocity", lambda msg, i=truck_id: self._speed_cb(msg, i), 10
+            )
+            self.create_subscription(
+                Float32, f"/truck{truck_id}/battery_soc", lambda msg, i=truck_id: self._soc_cb(msg, i), 10
+            )
+            self.create_subscription(
+                Float32, f"/truck{truck_id}/battery_power_w", lambda msg, i=truck_id: self._power_cb(msg, i), 10
+            )
+            self.create_subscription(
+                Float32, f"/truck{truck_id}/energy_wh_per_km", lambda msg, i=truck_id: self._whkm_cb(msg, i), 10
+            )
+
+        self.create_timer(0.1, self._update_ui)
+
+    def _speed_cb(self, msg: Float32, truck_id: int) -> None:
+        self.states[truck_id].speed_ms = float(msg.data)
+
+    def _soc_cb(self, msg: Float32, truck_id: int) -> None:
+        self.states[truck_id].soc = float(msg.data)
+
+    def _power_cb(self, msg: Float32, truck_id: int) -> None:
+        self.states[truck_id].power_w = float(msg.data)
+
+    def _whkm_cb(self, msg: Float32, truck_id: int) -> None:
+        self.states[truck_id].wh_per_km = float(msg.data)
+
+    def _update_ui(self) -> None:
+        self.dashboard.update(self.states)
+
+
+class EnergyDashboardUI:
+    def __init__(self, root: tk.Tk, truck_count: int = 3):
+        self.root = root
+        self.root.title("Truck Energy Dashboard")
+        self.root.configure(bg="#F3F6FA")
+        self.truck_count = truck_count
+        self.max_power_kw = 250.0
+
+        self.cards: Dict[int, Dict[str, tk.Widget]] = {}
+        self._build_layout()
+
+    def _build_layout(self) -> None:
+        header = tk.Frame(self.root, bg="#F3F6FA")
+        header.pack(fill=tk.X, padx=14, pady=(10, 6))
+
+        title = tk.Label(
+            header,
+            text="Electric Truck Energy Monitor",
+            font=("Helvetica", 18, "bold"),
+            bg="#F3F6FA",
+            fg="#132238",
+        )
+        title.pack(side=tk.LEFT)
+
+        self.summary_label = tk.Label(
+            header,
+            text="Fleet Avg: 0.0 Wh/km",
+            font=("Helvetica", 12),
+            bg="#F3F6FA",
+            fg="#2B4A6F",
+        )
+        self.summary_label.pack(side=tk.RIGHT)
+
+        body = tk.Frame(self.root, bg="#F3F6FA")
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+
+        for truck_id in range(self.truck_count):
+            card = tk.Frame(body, bg="white", bd=1, relief=tk.SOLID, padx=10, pady=10)
+            card.grid(row=0, column=truck_id, padx=6, pady=6, sticky="nsew")
+            body.grid_columnconfigure(truck_id, weight=1)
+
+            tk.Label(
+                card,
+                text=f"Truck {truck_id}",
+                font=("Helvetica", 15, "bold"),
+                bg="white",
+                fg="#17375E",
+            ).pack(anchor="w")
+
+            speed_label = tk.Label(card, text="Speed: 0.0 km/h", font=("Helvetica", 12), bg="white")
+            speed_label.pack(anchor="w", pady=(8, 2))
+
+            soc_label = tk.Label(card, text="SOC: 0.0 %", font=("Helvetica", 12), bg="white")
+            soc_label.pack(anchor="w", pady=2)
+
+            power_label = tk.Label(card, text="Power: 0.0 kW", font=("Helvetica", 12), bg="white")
+            power_label.pack(anchor="w", pady=2)
+
+            whkm_label = tk.Label(card, text="Efficiency: 0.0 Wh/km", font=("Helvetica", 12), bg="white")
+            whkm_label.pack(anchor="w", pady=(2, 8))
+
+            tk.Label(card, text="SOC", font=("Helvetica", 10), bg="white", fg="#4A5568").pack(anchor="w")
+            soc_canvas = tk.Canvas(card, width=220, height=16, bg="#E6ECF2", highlightthickness=0)
+            soc_canvas.pack(anchor="w", pady=(2, 8))
+
+            tk.Label(card, text="Power Usage", font=("Helvetica", 10), bg="white", fg="#4A5568").pack(anchor="w")
+            power_canvas = tk.Canvas(card, width=220, height=16, bg="#E6ECF2", highlightthickness=0)
+            power_canvas.pack(anchor="w")
+
+            self.cards[truck_id] = {
+                "speed_label": speed_label,
+                "soc_label": soc_label,
+                "power_label": power_label,
+                "whkm_label": whkm_label,
+                "soc_canvas": soc_canvas,
+                "power_canvas": power_canvas,
+            }
+
+    def update(self, states: Dict[int, TruckEnergyState]) -> None:
+        total_whkm = 0.0
+        for truck_id in range(self.truck_count):
+            st = states[truck_id]
+            speed_kmh = st.speed_ms * 3.6
+            power_kw = st.power_w / 1000.0
+            total_whkm += st.wh_per_km
+
+            card = self.cards[truck_id]
+            card["speed_label"].config(text=f"Speed: {speed_kmh:5.1f} km/h")
+            card["soc_label"].config(text=f"SOC: {st.soc:5.1f} %")
+            card["power_label"].config(text=f"Power: {power_kw:6.1f} kW")
+            card["whkm_label"].config(text=f"Efficiency: {st.wh_per_km:6.1f} Wh/km")
+
+            self._draw_bar(card["soc_canvas"], min(max(st.soc / 100.0, 0.0), 1.0), "#1AAE6F")
+            power_ratio = min(max(abs(power_kw) / self.max_power_kw, 0.0), 1.0)
+            power_color = "#D64545" if power_kw >= 0.0 else "#2E86DE"
+            self._draw_bar(card["power_canvas"], power_ratio, power_color)
+
+        avg = total_whkm / max(1, self.truck_count)
+        self.summary_label.config(text=f"Fleet Avg: {avg:.1f} Wh/km")
+
+    @staticmethod
+    def _draw_bar(canvas: tk.Canvas, ratio: float, color: str) -> None:
+        canvas.delete("all")
+        full_w = int(canvas["width"])
+        bar_w = int(full_w * ratio)
+        canvas.create_rectangle(0, 0, full_w, 16, fill="#E6ECF2", width=0)
+        canvas.create_rectangle(0, 0, bar_w, 16, fill=color, width=0)
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    root = tk.Tk()
+    ui = EnergyDashboardUI(root, truck_count=3)
+    node = EnergySubscriber(ui, truck_count=3)
+
+    def shutdown():
+        try:
+            node.destroy_node()
+            rclpy.shutdown()
+        except Exception:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", shutdown)
+    signal.signal(signal.SIGINT, lambda _sig, _frame: shutdown())
+
+    def spin_ros():
+        if rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.05)
+            root.after(30, spin_ros)
+
+    root.after(30, spin_ros)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

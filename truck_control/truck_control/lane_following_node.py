@@ -755,8 +755,4 @@ def main(args=None):
         print("ROS2 노드/스레드 종료")
 
 if __name__ == '__main__':
-<<<<<<< HEAD
     main()
-=======
-    main()
->>>>>>> Fix: Lane change guard logic for Truck 0
