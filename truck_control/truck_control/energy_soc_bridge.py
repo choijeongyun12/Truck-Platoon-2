@@ -169,7 +169,7 @@ class EnergySocBridgeNode(Node):
             power_w = self._estimate_power_w(st)
             st.battery_power_w = power_w
 
-            delta_wh = max(0.0, power_w) * (dt / 3600.0)
+            delta_wh = power_w * (dt / 3600.0)
             st.energy_wh += delta_wh
             st.distance_m += max(0.0, st.velocity_ms) * dt
 
