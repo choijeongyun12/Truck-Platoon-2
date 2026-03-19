@@ -161,8 +161,55 @@ def detect_lane(image, truck_id, last_left_fit, last_right_fit, last_left_slope,
     extra = [last_left_fit, last_right_fit, last_left_slope, last_right_slope]
     return lane_overlay, lane_positions, extra
 
+def estimate_lane_center_error(lane_positions, img_width, target_lane='center',
+                               transition_factor=0.0, is_lane_changing=False):
+    if not lane_positions or lane_positions.get('center_left') is None or lane_positions.get('center_right') is None:
+        return 0.0
+
+    def _pick_x(key):
+        if not is_lane_changing:
+            mid_key = f"{key}_mid"
+            if lane_positions.get(mid_key) is not None:
+                return lane_positions[mid_key]
+        return lane_positions.get(key)
+
+    img_center = img_width / 2
+    current_left = _pick_x('center_left')
+    current_right = _pick_x('center_right')
+    if current_left is None or current_right is None:
+        return 0.0
+
+    lane_width = current_right - current_left
+    target_left, target_right = current_left, current_right
+    if target_lane == 'left':
+        adj_left = _pick_x('adj_left')
+        if adj_left is not None:
+            target_left, target_right = adj_left, adj_left + lane_width
+        else:
+            target_left, target_right = current_left - lane_width, current_right - lane_width
+    elif target_lane == 'right':
+        adj_right = _pick_x('adj_right')
+        if adj_right is not None:
+            target_left, target_right = adj_right - lane_width, adj_right
+        else:
+            target_left, target_right = current_left + lane_width, current_right + lane_width
+
+    if is_lane_changing:
+        tf = float(np.clip(transition_factor, 0.0, 1.0))
+        transition_factor = tf * tf * (3.0 - 2.0 * tf)
+
+    blended_left = current_left + (target_left - current_left) * transition_factor
+    blended_right = current_right + (target_right - current_right) * transition_factor
+    lane_center = (blended_left + blended_right) / 2
+    error = (lane_center - img_center) / img_center
+
+    if is_lane_changing:
+        error = float(np.tanh(error * 1.3) * 0.75)
+
+    return float(error)
+
 def calculate_steering(pid_controller, lane_positions, img_width, target_lane='center',
-                       transition_factor=0.0, is_lane_changing=False):
+                       transition_factor=0.0, is_lane_changing=False, dt=1.0):
     if not lane_positions or lane_positions.get('center_left') is None or lane_positions.get('center_right') is None:
         return 0.0
 
@@ -204,7 +251,7 @@ def calculate_steering(pid_controller, lane_positions, img_width, target_lane='c
         # 큰 오차 영역을 압축해서 과조향 억제
         error = float(np.tanh(error * 1.3) * 0.75)
 
-    pid_output = pid_controller.compute(error)
+    pid_output = pid_controller.compute(error, dt=dt)
 
     if is_lane_changing:
         return np.clip(-pid_output * 16.0, -12.0, 12.0)

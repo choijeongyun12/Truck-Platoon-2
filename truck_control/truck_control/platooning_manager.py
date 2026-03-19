@@ -102,9 +102,3 @@ class PlatooningManager:
 
         self.prev_error = distance_error
         self.prev_time = current_time
-
-        #self.node.get_logger().info(
-            #f"[{self.namespace}] 거리: {self.lidar_distance:.2f} m, 오차: {distance_error:.2f} m, "
-            #f"PID 보정: {pid_correction:.2f}, "'''
-            #f"스로틀 명령: {speed_command:.2f} m/s")
-        

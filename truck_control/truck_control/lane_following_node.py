@@ -6,6 +6,8 @@ from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_srvs.srv import SetBool
 import queue
+import os
+import sys
 import threading
 import time
 import cv2
@@ -16,6 +18,17 @@ from .lane_detect import apply_birds_eye_view, detect_lane, calculate_steering
 from .command_publisher import publish_commands
 from .distance_sensor import DistanceSensor
 from .platooning_manager import PlatooningManager
+
+try:
+    from agents.navigation.global_route_planner import GlobalRoutePlanner
+except ModuleNotFoundError:
+    carla_pythonapi_dir = os.path.expanduser('~/carla/PythonAPI/carla')
+    if os.path.isdir(carla_pythonapi_dir) and carla_pythonapi_dir not in sys.path:
+        sys.path.append(carla_pythonapi_dir)
+    try:
+        from agents.navigation.global_route_planner import GlobalRoutePlanner
+    except ModuleNotFoundError:
+        GlobalRoutePlanner = None
 
 class ManeuverState:
     IDLE = 0
@@ -77,11 +90,24 @@ class LaneFollowingNode(Node):
         self.last_right_fit = {i: None for i in range(3)}
         self.last_left_slope = {i: 0.0 for i in range(3)}
         self.last_right_slope = {i: 0.0 for i in range(3)}
+        self.last_target_waypoint = {i: None for i in range(3)}
+        self.waypoint_routes = {i: [] for i in range(3)}
         self.leader_steering = 0.0
         self.bridge = CvBridge()
         self.pid_controllers = {i: PIDController(Kp=0.8, Ki=0.01, Kd=0.2) for i in range(3)}
         self.truck_views = {i: None for i in range(3)}
         self.ss_masks_bev = {i: None for i in range(3)}
+        self.waypoint_tracking_only = True
+        self.waypoint_route_spacing_m = 2.0
+        self.waypoint_route_horizon_m = 30.0
+        self.waypoint_pass_radius_m = 1.5
+        self.waypoint_route_rebuild_min_m = 10.0
+        self.waypoint_lookahead_min = 4.0
+        self.waypoint_lookahead_max = 15.0
+        self.waypoint_lookahead_gain = 0.35
+        self.waypoint_lane_width_m = 3.5
+        self.waypoint_cte_weight = 1.0
+        self.waypoint_heading_weight = 1.2
         
         # lane-change FSM params
         self.current_target_lane = {i: 'center' for i in range(3)}
@@ -146,12 +172,205 @@ class LaneFollowingNode(Node):
                             pass
             if len(self.carla_actors) != 3:
                 self.get_logger().warn(f"Warning: Found {len(self.carla_actors)} truck actors, expected 3.")
+            
+            self.carla_map = self.world.get_map()
+            self.get_logger().info("CARLA map successfully loaded.")
 
         except Exception as e:
             self.get_logger().error(f"Failed to connect to CARLA or find actors: {e}")
             self.world = None
+            self.carla_map = None
 
-    # -------------------- 라이다 가드 --------------------
+    def get_vehicle_waypoint(self, truck_id):
+        actor = self.carla_actors.get(truck_id)
+        if actor and self.carla_map:
+            return self.carla_map.get_waypoint(actor.get_location())
+        return None
+
+    def _distance_between_locations(self, loc_a, loc_b):
+        dx = float(loc_a.x - loc_b.x)
+        dy = float(loc_a.y - loc_b.y)
+        dz = float(loc_a.z - loc_b.z)
+        return float(np.sqrt(dx * dx + dy * dy + dz * dz))
+
+    def _distance_between_waypoints(self, wp_a, wp_b):
+        return self._distance_between_locations(wp_a.transform.location, wp_b.transform.location)
+
+    def _heading_delta(self, yaw_a_deg, yaw_b_deg):
+        delta = np.radians(yaw_b_deg - yaw_a_deg)
+        return float(np.arctan2(np.sin(delta), np.cos(delta)))
+
+    def _project_forward_distance(self, transform, target_location):
+        vehicle_loc = transform.location
+        dx = float(target_location.x - vehicle_loc.x)
+        dy = float(target_location.y - vehicle_loc.y)
+        dz = float(target_location.z - vehicle_loc.z)
+        forward = transform.get_forward_vector()
+        return float(dx * forward.x + dy * forward.y + dz * forward.z)
+
+    def _select_best_waypoint_vector(self, current_transform, candidates):
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        curr_loc = current_transform.location
+        curr_fwd = current_transform.get_forward_vector()
+        curr_fwd_2d = np.array([curr_fwd.x, curr_fwd.y])
+        curr_fwd_2d /= np.linalg.norm(curr_fwd_2d)
+
+        best_wp = None
+        max_dot = -2.0
+
+        for wp in candidates:
+            target_loc = wp.transform.location
+            vec_to_wp = np.array([
+                target_loc.x - curr_loc.x,
+                target_loc.y - curr_loc.y
+            ])
+            norm = np.linalg.norm(vec_to_wp)
+            if norm < 0.1:
+                wp_fwd = wp.transform.get_forward_vector()
+                vec_to_wp = np.array([wp_fwd.x, wp_fwd.y])
+            else:
+                vec_to_wp /= norm
+            
+            dot = np.dot(curr_fwd_2d, vec_to_wp)
+            if dot > max_dot:
+                max_dot = dot
+                best_wp = wp
+        
+        return best_wp
+
+    def _find_adjacent_driving_lane(self, waypoint, direction):
+        if waypoint is None:
+            return None
+
+        get_neighbor = waypoint.get_left_lane if direction == 'left' else waypoint.get_right_lane
+        candidate = get_neighbor()
+        visited = set()
+        while candidate is not None:
+            lane_ref = (candidate.road_id, candidate.section_id, candidate.lane_id)
+            if lane_ref in visited:
+                break
+            visited.add(lane_ref)
+            if candidate.lane_type == carla.LaneType.Driving:
+                return candidate
+            candidate = candidate.get_left_lane() if direction == 'left' else candidate.get_right_lane()
+        return None
+
+    def _build_waypoint_route(self, truck_id, seed_waypoint):
+        transform = self.get_vehicle_transform(truck_id)
+        if seed_waypoint is None or transform is None:
+            return []
+
+        route = [seed_waypoint]
+        traveled = 0.0
+        current_wp = seed_waypoint
+        max_steps = max(1, int(np.ceil(self.waypoint_horizon_m / max(0.5, self.waypoint_route_spacing_m)))) + 2 if hasattr(self, 'waypoint_horizon_m') else 20
+
+        for _ in range(max_steps):
+            try:
+                candidates = current_wp.next(self.waypoint_route_spacing_m)
+            except Exception:
+                break
+
+            if not candidates:
+                break
+
+            next_wp = self._select_best_waypoint_vector(transform, candidates)
+            if next_wp is None:
+                break
+
+            route.append(next_wp)
+            traveled += self._distance_between_waypoints(current_wp, next_wp)
+            current_wp = next_wp
+            transform = next_wp.transform
+
+            if traveled >= self.waypoint_route_horizon_m:
+                break
+
+        return route
+
+    def _prune_passed_waypoints(self, truck_id, transform):
+        route = self.waypoint_routes.get(truck_id, [])
+        while len(route) > 1:
+            first_wp = route[0]
+            distance = self._distance_between_locations(transform.location, first_wp.transform.location)
+            forward_dist = self._project_forward_distance(transform, first_wp.transform.location)
+            if distance <= self.waypoint_pass_radius_m or forward_dist < -0.5:
+                route.pop(0)
+                continue
+            break
+
+    def _choose_route_target(self, truck_id, transform, lookahead):
+        route = self.waypoint_routes.get(truck_id, [])
+        if not route:
+            return None
+
+        accumulated = self._distance_between_locations(transform.location, route[0].transform.location)
+        if accumulated >= lookahead:
+            return route[0]
+
+        for idx in range(1, len(route)):
+            accumulated += self._distance_between_waypoints(route[idx - 1], route[idx])
+            if accumulated >= lookahead:
+                return route[idx]
+
+        return route[-1]
+
+    def _resolve_target_waypoint(self, truck_id):
+        transform = self.get_vehicle_transform(truck_id)
+        current_wp = self.get_vehicle_waypoint(truck_id)
+        if transform is None or current_wp is None:
+            return None
+
+        seed_wp = current_wp
+        target_lane = self.current_target_lane.get(truck_id, 'center')
+        if target_lane in ('left', 'right'):
+            adjacent = self._find_adjacent_driving_lane(current_wp, target_lane)
+            if adjacent is not None:
+                seed_wp = adjacent
+
+        route = self.waypoint_routes.get(truck_id, [])
+        needs_rebuild = (
+            not route
+            or self._distance_between_locations(transform.location, route[-1].transform.location) < self.waypoint_route_rebuild_min_m
+        )
+        if needs_rebuild:
+            self.waypoint_routes[truck_id] = self._build_waypoint_route(truck_id, seed_wp)
+
+        self._prune_passed_waypoints(truck_id, transform)
+
+        speed = float(self.current_velocities.get(truck_id, 0.0))
+        lookahead = float(np.clip(
+            self.waypoint_lookahead_min + self.waypoint_lookahead_gain * speed,
+            self.waypoint_lookahead_min,
+            self.waypoint_lookahead_max,
+        ))
+        target_wp = self._choose_route_target(truck_id, transform, lookahead)
+        self.last_target_waypoint[truck_id] = target_wp
+        return target_wp
+
+    def _compute_waypoint_tracking_error(self, truck_id, target_waypoint):
+        transform = self.get_vehicle_transform(truck_id)
+        if transform is None or target_waypoint is None:
+            return None
+
+        vehicle_loc = transform.location
+        target_loc = target_waypoint.transform.location
+        target_yaw_rad = np.radians(target_waypoint.transform.rotation.yaw)
+
+        dx = target_loc.x - vehicle_loc.x
+        dy = target_loc.y - vehicle_loc.y
+        right_x = -np.sin(target_yaw_rad)
+        right_y = np.cos(target_yaw_rad)
+        lateral_error_m = dx * right_x + dy * right_y
+        heading_error = self._heading_delta(transform.rotation.yaw, target_waypoint.transform.rotation.yaw)
+
+        normalized_cte = lateral_error_m / max(1e-3, self.waypoint_lane_width_m)
+        return float((self.waypoint_cte_weight * normalized_cte) + (self.waypoint_heading_weight * heading_error))
+
     def _cancel_guard(self, truck_id, tag):
         key = (truck_id, tag)
         t = self._guard_timer.pop(key, None)
@@ -168,7 +387,6 @@ class LaneFollowingNode(Node):
         start_ts = time.monotonic()
         scale = self.guard_scale.get(tag, 1.0)
         def _check_and_change():
-            # 수동(MANUAL) 명령일 때는 IDLE 상태여도 종료하지 않도록 조건 수정
             if tag != 'MANUAL' and self.maneuver_state in (ManeuverState.IDLE, ManeuverState.REORDER_COMPLETE, ManeuverState.COOLDOWN):
                 self.get_logger().info(f"[{tag}] Truck {truck_id} 가드 취소(FSM 종료/전이)")
                 return self._cancel_guard(truck_id, tag)
@@ -206,7 +424,32 @@ class LaneFollowingNode(Node):
                 return None
         return None
 
-    # -------------------- ROS Callbacks --------------------
+    def _distance_to_platoon_leader(self, follower_id):
+        if follower_id not in self.truck_order:
+            return None
+        follower_rank = self.truck_order.index(follower_id)
+        if follower_rank <= 0:
+            return None
+
+        leader_id = self.truck_order[follower_rank - 1]
+        follower_actor = self.carla_actors.get(follower_id)
+        leader_actor = self.carla_actors.get(leader_id)
+        follower_tf = self.get_vehicle_transform(follower_id)
+        leader_tf = self.get_vehicle_transform(leader_id)
+        if follower_actor is None or leader_actor is None or follower_tf is None or leader_tf is None:
+            return None
+
+        relative_vec = leader_tf.location - follower_tf.location
+        follower_forward = follower_tf.get_forward_vector()
+        forward_distance = float(relative_vec.dot(follower_forward))
+        if forward_distance <= 0.0:
+            return None
+
+        follower_extent = float(getattr(follower_actor.bounding_box.extent, 'x', 0.0))
+        leader_extent = float(getattr(leader_actor.bounding_box.extent, 'x', 0.0))
+        gap_distance = forward_distance - follower_extent - leader_extent
+        return max(0.0, gap_distance)
+
     def ss_callback(self, msg: Image, truck_id: int):
         try:
             ss_img = self.bridge.imgmsg_to_cv2(msg, 'mono8')
@@ -240,14 +483,25 @@ class LaneFollowingNode(Node):
         self.last_left_slope[truck_id] = lslope
         self.last_right_slope[truck_id] = rslope
         is_changing = self.current_target_lane[truck_id] != 'center'
-        steering_angle = calculate_steering(
-            self.pid_controllers[truck_id],
-            lane_positions,
-            frame.shape[1],
-            self.current_target_lane[truck_id],
-            self.transition_factor[truck_id],
-            is_lane_changing=is_changing
-        )
+        steering_angle = 0.0
+        used_waypoint = False
+        target_waypoint = self._resolve_target_waypoint(truck_id)
+        waypoint_error = self._compute_waypoint_tracking_error(truck_id, target_waypoint)
+
+        if waypoint_error is not None:
+            pid_output = self.pid_controllers[truck_id].compute(waypoint_error)
+            steering_angle = float(np.clip(-pid_output * 80.0, -70.0, 70.0))
+            used_waypoint = True
+
+        if not used_waypoint and not self.waypoint_tracking_only:
+            steering_angle = calculate_steering(
+                self.pid_controllers[truck_id],
+                lane_positions,
+                frame.shape[1],
+                self.current_target_lane[truck_id],
+                self.transition_factor[truck_id],
+                is_lane_changing=is_changing
+            )
         steer_msg = Float32(); steer_msg.data = steering_angle
         self.steer_publishers[truck_id].publish(steer_msg)
         self.last_steering[truck_id] = steering_angle
@@ -395,42 +649,27 @@ class LaneFollowingNode(Node):
         def is_lane_change_complete(truck_id):
             return self.transition_factor.get(truck_id, 0.0) >= 1.0
 
-        # --- 시나리오 1: Reorder (선두 -> 후미) ---
         if self.maneuver_state == ManeuverState.LEADER_EXITS_LANE:
             if is_lane_change_complete(self.exiting_leader_id):
                 self.reset_lane_state(self.exiting_leader_id)
                 self.maneuver_state = ManeuverState.LEADER_CREATES_GAP
                 self.get_logger().info("리더 갭 생성 단계 진입(감속 및 거리 확인 시작)")
         
-        # [수정된 최종 로직]
         elif self.maneuver_state == ManeuverState.LEADER_CREATES_GAP:
             leader_tf = self.get_vehicle_transform(self.exiting_leader_id)
             successor_tf = self.get_vehicle_transform(self.successor_id)
 
             if leader_tf and successor_tf:
-                # 후속 차량(successor)의 전방 벡터를 기준으로 리더의 상대 위치 계산
                 relative_vec = leader_tf.location - successor_tf.location
                 successor_forward_vec = successor_tf.get_forward_vector()
-                
-                # forward_dist: 리더가 후속 차량보다 뒤에 있으면 음수, 앞에 있으면 양수
                 forward_dist = relative_vec.dot(successor_forward_vec)
-                
                 is_behind = forward_dist < 0
-                longitudinal_distance = abs(forward_dist) # 종방향 거리
+                longitudinal_distance = abs(forward_dist)
 
-                # 조건: 1. 리더가 후속 차량 뒤에 있고, 2. 그 거리가 안전거리 이상일 때
                 if is_behind and longitudinal_distance >= self.REORDER_SAFE_GAP_DISTANCE_M:
-                    self.get_logger().info(
-                        f"안전거리 확보 (뒤로 {longitudinal_distance:.1f}m). 후속 차량 진입 시작."
-                    )
+                    self.get_logger().info(f"안전거리 확보 (뒤로 {longitudinal_distance:.1f}m). 후속 차량 진입 시작.")
                     self.maneuver_state = ManeuverState.SUCCESSOR_ENTERS_GAP
                     self._guarded_lane_change(self.successor_id, self.reorder_direction, tag="SUCCESSOR")
-                else:
-                    # 현재 상태 로깅 (디버깅에 유용)
-                    self.get_logger().debug(
-                        f"갭 생성 대기 중... 리더 상대 위치: {forward_dist:.1f}m "
-                        f"(목표: 뒤로 {self.REORDER_SAFE_GAP_DISTANCE_M}m 이상)"
-                    )
             else:
                  self.get_logger().debug("Reorder: 차량 transform 정보를 기다리는 중...")
 
@@ -453,7 +692,6 @@ class LaneFollowingNode(Node):
                 self.maneuver_state = ManeuverState.REORDER_COMPLETE
                 self.finalize_reorder()
         
-        # --- 시나리오 2: Promote (후행 -> 선두) ---
         elif self.maneuver_state == ManeuverState.PROMOTE_TARGET_EXITS:
             if is_lane_change_complete(self.promote_target_id):
                 self.reset_lane_state(self.promote_target_id)
@@ -468,7 +706,6 @@ class LaneFollowingNode(Node):
                 leader_forward_vec = leader_tf.get_forward_vector()
                 relative_vec = target_tf.location - leader_tf.location
                 forward_distance = relative_vec.dot(leader_forward_vec)
-                
                 is_ahead = forward_distance > 0
                 is_safe_distance = forward_distance >= self.PROMOTE_SAFE_REENTRY_DISTANCE_M
 
@@ -476,8 +713,6 @@ class LaneFollowingNode(Node):
                     self.get_logger().info(f"Promote: 안전거리({forward_distance:.1f}m) 확보. 대상 차량 선두 합류 시도.")
                     self.maneuver_state = ManeuverState.PROMOTE_TARGET_REENTERS
                     self._promote_target_reenter()
-            else:
-                self.get_logger().debug("Promote: 차량 transform 정보를 기다리는 중...")
 
         elif self.maneuver_state == ManeuverState.PROMOTE_TARGET_REENTERS:
             if is_lane_change_complete(self.promote_target_id):
@@ -486,7 +721,6 @@ class LaneFollowingNode(Node):
 
     def _leader_reenter(self):
         if self.maneuver_state == ManeuverState.LEADER_REENTERS_LANE:
-            self.get_logger().info("리더 재합류 준비: CARLA 좌표 기반 확인 루프 시작")
             self._start_rejoin_check()
 
     def _start_rejoin_check(self):
@@ -502,7 +736,6 @@ class LaneFollowingNode(Node):
 
         leader_id = self.exiting_leader_id
         follower_id = self.follower_id
-
         if leader_id == -1 or follower_id == -1:
             self._rejoin_timer = None
             return
@@ -514,7 +747,6 @@ class LaneFollowingNode(Node):
             relative_vec = leader_tf.location - follower_tf.location
             follower_forward_vec = follower_tf.get_forward_vector()
             follower_right_vec = follower_tf.get_right_vector()
-            
             forward_dist = relative_vec.dot(follower_forward_vec)
             lateral_dist = abs(relative_vec.dot(follower_right_vec))
 
@@ -524,27 +756,19 @@ class LaneFollowingNode(Node):
 
             if is_behind and is_in_longitudinal_band and is_laterally_aligned:
                 reenter_dir = self._opposite(self.reorder_direction)
-                self.get_logger().info(
-                    f"[REJOIN by Coords] 조건 만족 (전후방: {forward_dist:.1f}m, 좌우: {lateral_dist:.1f}m). "
-                    f"리더 {leader_id}가 {reenter_dir} 방향으로 재합류 시작."
-                )
                 self._guarded_lane_change(leader_id, reenter_dir, tag="REJOIN")
                 self._rejoin_timer = None
                 return
-            else:
-                self.get_logger().debug(f"[REJOIN by Coords] 재합류 대기... (전후방: {forward_dist:.1f}m, 좌우: {lateral_dist:.1f}m)")
 
         self._rejoin_timer = threading.Timer(self.rejoin_check_period, self._rejoin_tick)
         self._rejoin_timer.start()
 
     def _promote_target_reenter(self):
         reenter_dir = self._opposite(self.reorder_direction)
-        self.get_logger().info(f"Promote: 타겟 차량 {self.promote_target_id} 선두 재합류 시작 ({reenter_dir})")
         self.change_lane(self.promote_target_id, reenter_dir)
 
     def finalize_reorder(self):
         if self.maneuver_state == ManeuverState.COOLDOWN: return
-        self.get_logger().info("===== 기동 완료: 모든 상태 초기화 =====")
         for i in range(3):
             self._cancel_guard(i, "SUCCESSOR")
             self._cancel_guard(i, "FOLLOWER")
@@ -558,12 +782,10 @@ class LaneFollowingNode(Node):
 
         if self.exiting_leader_id != -1:
             self.truck_order = [self.successor_id, self.follower_id, self.exiting_leader_id]
-            self.get_logger().info(f"= Reorder 완료: 새로운 순서는 {self.truck_order} =")
         elif self.promote_target_id != -1:
             old_order = list(self.truck_order)
             old_order.remove(self.promote_target_id)
             self.truck_order = [self.promote_target_id] + old_order
-            self.get_logger().info(f"= Promote 완료: 새로운 순서는 {self.truck_order} =")
 
         for i in range(3):
             self.reset_lane_state(i)
@@ -585,7 +807,6 @@ class LaneFollowingNode(Node):
         self.follower_id = -1
         self.promote_target_id = -1
         self.promote_original_leader_id = -1
-        self.get_logger().info("===== 쿨다운 종료: IDLE 상태로 복귀 =====")
 
     def publish_commands_from_module(self):
         if not self.truck_order: return
@@ -601,7 +822,6 @@ class LaneFollowingNode(Node):
         self.emergency_stop = False
         if leader_front_distance is not None and leader_front_distance < 3.0:
             self.emergency_stop = True
-            self.get_logger().warn(f"[리더 Truck {current_leader_id}] 비상 정지! 전방 장애물 거리: {leader_front_distance:.2f} m")
 
         for i, truck_id in enumerate(self.truck_order):
             if self.emergency_stop:
@@ -611,47 +831,19 @@ class LaneFollowingNode(Node):
 
             if is_promoting:
                 if truck_id == self.promote_target_id:
-                    try:
-                        rank = self.truck_order.index(self.promote_target_id)
-                    except ValueError:
-                        rank = -1
-
-                    if rank == 1:
-                        promote_speed = self.target_velocity * 1.2
-                    elif rank == 2:
-                        promote_speed = self.target_velocity * 1.1
-                    else:
-                        promote_speed = self.target_velocity * 1.2
-
-                    publish_commands(
-                        [self.throttle_publishers[truck_id]],
-                        [self.current_velocities.get(truck_id, 0.0)],
-                        promote_speed,
-                        [self.last_steering.get(truck_id, 0.0)]
-                    )
+                    rank = self.truck_order.index(self.promote_target_id) if self.promote_target_id in self.truck_order else -1
+                    promote_speed = self.target_velocity * 1.2 if rank == 1 else self.target_velocity * 1.1
+                    publish_commands([self.throttle_publishers[truck_id]], [self.current_velocities.get(truck_id, 0.0)], promote_speed, [self.last_steering.get(truck_id, 0.0)])
                     continue
-                else:
-                    if (self.promote_target_id == self.truck_order[1]) and (truck_id == self.truck_order[2]):
-                        publish_commands(
-                            [self.throttle_publishers[truck_id]],
-                            [self.current_velocities.get(truck_id, 0.0)],
-                            self.target_velocity,
-                            [self.last_steering.get(truck_id, 0.0)]
-                        )
-                        continue
-
-                if self.maneuver_state in (ManeuverState.PROMOTE_PLATOON_CREATES_GAP,
-                                           ManeuverState.PROMOTE_TARGET_REENTERS):
-                    gap_creation_speed = self.target_velocity * 0.8
-                    publish_commands(
-                        [self.throttle_publishers[truck_id]],
-                        [self.current_velocities.get(truck_id, 0.0)],
-                        gap_creation_speed,
-                        [self.last_steering.get(truck_id, 0.0)]
-                    )
+                elif (self.promote_target_id == self.truck_order[1]) and (truck_id == self.truck_order[2]):
+                    publish_commands([self.throttle_publishers[truck_id]], [self.current_velocities.get(truck_id, 0.0)], self.target_velocity, [self.last_steering.get(truck_id, 0.0)])
                     continue
 
-            if i == 0: # Current Leader
+                if self.maneuver_state in (ManeuverState.PROMOTE_PLATOON_CREATES_GAP, ManeuverState.PROMOTE_TARGET_REENTERS):
+                    publish_commands([self.throttle_publishers[truck_id]], [self.current_velocities.get(truck_id, 0.0)], self.target_velocity * 0.8, [self.last_steering.get(truck_id, 0.0)])
+                    continue
+
+            if i == 0:
                 final_target_velocity = self.target_velocity
                 if leader_front_distance is not None:
                     if leader_front_distance <= 10.0: final_target_velocity = 0.0
@@ -659,84 +851,31 @@ class LaneFollowingNode(Node):
                         ratio = (leader_front_distance - 10.0) / 20.0
                         final_target_velocity = max(0.0, self.target_velocity * ratio)
                 
-                slow_phases = (
-                    ManeuverState.LEADER_CREATES_GAP,
-                    ManeuverState.SUCCESSOR_ENTERS_GAP,
-                    ManeuverState.FOLLOWER_ENTERS_GAP,
-                )
-                if truck_id == self.exiting_leader_id and self.maneuver_state in slow_phases:
-                    gap_creation_speed = self.target_velocity * self.leader_slow_factor
-                    final_target_velocity = min(final_target_velocity, gap_creation_speed)
+                if truck_id == self.exiting_leader_id and self.maneuver_state in (ManeuverState.LEADER_CREATES_GAP, ManeuverState.SUCCESSOR_ENTERS_GAP, ManeuverState.FOLLOWER_ENTERS_GAP):
+                    final_target_velocity = min(final_target_velocity, self.target_velocity * self.leader_slow_factor)
 
-                publish_commands(
-                    [self.throttle_publishers[truck_id]],
-                    [self.current_velocities.get(truck_id, 0.0)],
-                    final_target_velocity,
-                    [self.last_steering.get(truck_id, 0.0)]
-                )
-            else: # Followers
-                lidar_distance = self.distance_sensor[truck_id].get_distance()
-                LOSS_DIST = 40.0
-                if lidar_distance is None or lidar_distance > LOSS_DIST:
-                    publish_commands(
-                        [self.throttle_publishers[truck_id]],
-                        [self.current_velocities.get(truck_id, 0.0)],
-                        self.target_velocity,
-                        [self.last_steering.get(truck_id, 0.0)]
-                    )
+                publish_commands([self.throttle_publishers[truck_id]], [self.current_velocities.get(truck_id, 0.0)], final_target_velocity, [self.last_steering.get(truck_id, 0.0)])
+            else:
+                leading_distance = self._distance_to_platoon_leader(truck_id)
+                if leading_distance is None or leading_distance > 40.0:
+                    publish_commands([self.throttle_publishers[truck_id]], [self.current_velocities.get(truck_id, 0.0)], self.target_velocity, [self.last_steering.get(truck_id, 0.0)])
                 else:
-                    self.platooning_manager[truck_id].update_distance(
-                        lidar_distance, emergency_stop=self.emergency_stop
-                    )
+                    self.platooning_manager[truck_id].update_distance(leading_distance, emergency_stop=self.emergency_stop)
 
 def opencv_loop(node: LaneFollowingNode):
     window_name = "Combined Bird-Eye View"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    print("\n--- OpenCV 창 활성 ---")
-    print(">>> 전체 재배치 (선두->후미): 't'(왼쪽), 'y'(오른쪽)")
-    print(">>> 후행차량 선두이동: 'j'(2번->1번), 'k'(3번->1번) - 왼쪽으로만 동작")
-    print("---------------------------------")
-    print(">>> 개별 차선 변경 (기동 중 비활성)")
-    print(">>> Truck 0: 'q'(왼), 'e'(오)")
-    print(">>> Truck 1: 'a'(왼), 'd'(오)")
-    print(">>> Truck 2: 'z'(왼), 'c'(오)")
-    print(">>> 'ESC' 종료")
     while rclpy.ok():
-        views = []
-        for i in node.truck_order:
-            v = node.truck_views.get(i)
-            if v is None:
-                v = np.zeros((480, 640, 3), dtype=np.uint8)
-            views.append(v)
-        if len(views) == 3:
-            cv2.imshow(window_name, cv2.hconcat(views))
-        
+        views = [node.truck_views.get(i) if node.truck_views.get(i) is not None else np.zeros((480, 640, 3), dtype=np.uint8) for i in node.truck_order]
+        if len(views) == 3: cv2.imshow(window_name, cv2.hconcat(views))
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('t'):
-            print(">>> 재배치(왼쪽)")
-            node.change_queue.put(('reorder', 'left'))
-        elif key == ord('y'):
-            print(">>> 재배치(오른쪽)")
-            node.change_queue.put(('reorder', 'right'))
+        if key == ord('t'): node.change_queue.put(('reorder', 'left'))
+        elif key == ord('y'): node.change_queue.put(('reorder', 'right'))
         elif key == ord('j'):
-            if len(node.truck_order) > 1:
-                target = node.truck_order[1]
-                print(f">>> Promote(왼쪽): Truck {target}을 선두로")
-                node.change_queue.put(('promote', target, 'left'))
+            if len(node.truck_order) > 1: node.change_queue.put(('promote', node.truck_order[1], 'left'))
         elif key == ord('k'):
-            if len(node.truck_order) > 2:
-                target = node.truck_order[2]
-                print(f">>> Promote(왼쪽): Truck {target}을 선두로")
-                node.change_queue.put(('promote', target, 'left'))
-        elif key == ord('q'): node.change_queue.put((0, 'left'))
-        elif key == ord('e'): node.change_queue.put((0, 'right'))
-        elif key == ord('a'): node.change_queue.put((1, 'left'))
-        elif key == ord('d'): node.change_queue.put((1, 'right'))
-        elif key == ord('z'): node.change_queue.put((2, 'left'))
-        elif key == ord('c'): node.change_queue.put((2, 'right'))
-        elif key == 27:
-            print("ESC 입력. 종료")
-            break
+            if len(node.truck_order) > 2: node.change_queue.put(('promote', node.truck_order[2], 'left'))
+        elif key == 27: break
     cv2.destroyAllWindows()
 
 def main(args=None):
@@ -744,15 +883,12 @@ def main(args=None):
     node = LaneFollowingNode()
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     ros_thread.start()
-    print("ROS2 노드 스핀(백그라운드) 시작")
     try:
         opencv_loop(node)
-    except KeyboardInterrupt:
-        print("Ctrl+C 입력. 종료")
+    except KeyboardInterrupt: pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
-        print("ROS2 노드/스레드 종료")
 
 if __name__ == '__main__':
     main()
