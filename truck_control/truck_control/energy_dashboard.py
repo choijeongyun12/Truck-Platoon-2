@@ -22,6 +22,11 @@ class EnergySubscriber(Node):
         self.dashboard = dashboard
         self.truck_count = truck_count
         self.states: Dict[int, TruckEnergyState] = {i: TruckEnergyState() for i in range(self.truck_count)}
+        self.maneuver_elapsed_sec = 0.0
+        self.last_maneuver_duration_sec = 0.0
+
+        self.create_subscription(Float32, '/platoon_maneuver_elapsed_sec', self._maneuver_elapsed_cb, 10)
+        self.create_subscription(Float32, '/platoon_maneuver_last_duration_sec', self._maneuver_last_duration_cb, 10)
 
         for truck_id in range(self.truck_count):
             self.create_subscription(
@@ -51,8 +56,14 @@ class EnergySubscriber(Node):
     def _whkm_cb(self, msg: Float32, truck_id: int) -> None:
         self.states[truck_id].wh_per_km = float(msg.data)
 
+    def _maneuver_elapsed_cb(self, msg: Float32) -> None:
+        self.maneuver_elapsed_sec = float(msg.data)
+
+    def _maneuver_last_duration_cb(self, msg: Float32) -> None:
+        self.last_maneuver_duration_sec = float(msg.data)
+
     def _update_ui(self) -> None:
-        self.dashboard.update(self.states)
+        self.dashboard.update(self.states, self.maneuver_elapsed_sec, self.last_maneuver_duration_sec)
 
 
 class EnergyDashboardUI:
@@ -79,14 +90,35 @@ class EnergyDashboardUI:
         )
         title.pack(side=tk.LEFT)
 
+        summary_frame = tk.Frame(header, bg="#F3F6FA")
+        summary_frame.pack(side=tk.RIGHT)
+
         self.summary_label = tk.Label(
-            header,
-            text="Fleet Avg: 0.0 Wh/km",
-            font=("Helvetica", 12),
+            summary_frame,
+            text="Fleet Efficiency: 0.0 Wh/km",
+            font=("Helvetica", 12, "bold"),
             bg="#F3F6FA",
             fg="#2B4A6F",
         )
-        self.summary_label.pack(side=tk.RIGHT)
+        self.summary_label.pack(anchor="e")
+
+        self.maneuver_status_label = tk.Label(
+            summary_frame,
+            text="Maneuver: Idle",
+            font=("Helvetica", 11),
+            bg="#F3F6FA",
+            fg="#4A5568",
+        )
+        self.maneuver_status_label.pack(anchor="e", pady=(4, 0))
+
+        self.maneuver_duration_label = tk.Label(
+            summary_frame,
+            text="Last Maneuver: 0.0 s",
+            font=("Helvetica", 11),
+            bg="#F3F6FA",
+            fg="#4A5568",
+        )
+        self.maneuver_duration_label.pack(anchor="e")
 
         body = tk.Frame(self.root, bg="#F3F6FA")
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
@@ -133,7 +165,7 @@ class EnergyDashboardUI:
                 "power_canvas": power_canvas,
             }
 
-    def update(self, states: Dict[int, TruckEnergyState]) -> None:
+    def update(self, states: Dict[int, TruckEnergyState], maneuver_elapsed_sec: float, last_maneuver_duration_sec: float) -> None:
         total_whkm = 0.0
         for truck_id in range(self.truck_count):
             st = states[truck_id]
@@ -153,7 +185,14 @@ class EnergyDashboardUI:
             self._draw_bar(card["power_canvas"], power_ratio, power_color)
 
         avg = total_whkm / max(1, self.truck_count)
-        self.summary_label.config(text=f"Fleet Avg: {avg:.1f} Wh/km")
+        self.summary_label.config(text=f"Fleet Efficiency: {avg:.1f} Wh/km")
+
+        if maneuver_elapsed_sec > 0.0:
+            self.maneuver_status_label.config(text=f"Maneuver Running: {maneuver_elapsed_sec:.1f} s")
+        else:
+            self.maneuver_status_label.config(text="Maneuver: Idle")
+
+        self.maneuver_duration_label.config(text=f"Last Maneuver: {last_maneuver_duration_sec:.1f} s")
 
     @staticmethod
     def _draw_bar(canvas: tk.Canvas, ratio: float, color: str) -> None:

@@ -63,6 +63,8 @@ class LaneFollowingNode(Node):
         self.follower_id = -1
         self.promote_target_id = -1
         self.promote_original_leader_id = -1
+        self.maneuver_start_time = None
+        self.last_maneuver_duration_sec = 0.0
 
         # IO wiring
         self.distance_sensor = {i: DistanceSensor(self, f'truck{i}') for i in range(3)}
@@ -70,6 +72,8 @@ class LaneFollowingNode(Node):
         self.steer_publishers = {i: self.create_publisher(Float32, f'/truck{i}/steer_control', 10) for i in range(3)}
         self.throttle_publishers = {i: self.create_publisher(Float32, f'/truck{i}/throttle_control', 10) for i in range(3)}
         self.order_publisher = self.create_publisher(Int32MultiArray, '/platoon_order', 10)
+        self.maneuver_elapsed_publisher = self.create_publisher(Float32, '/platoon_maneuver_elapsed_sec', 10)
+        self.maneuver_last_duration_publisher = self.create_publisher(Float32, '/platoon_maneuver_last_duration_sec', 10)
         self.velocity_subscribers = {
             i: self.create_subscription(Float32, f'/truck{i}/velocity', lambda msg, id=i: self.velocity_callback(msg, id), 10)
             for i in range(3)
@@ -121,6 +125,8 @@ class LaneFollowingNode(Node):
         self.change_timer = self.create_timer(0.1, self.process_change_queue)
         self.control_timer = self.create_timer(0.05, self.publish_commands_from_module)
         self.maneuver_timer = self.create_timer(0.2, self.manage_reorder_maneuver)
+        self.maneuver_metrics_timer = self.create_timer(0.1, self._publish_maneuver_metrics)
+        self.auto_scenario_timer = self.create_timer(0.1, self._maybe_trigger_auto_scenario)
         
         # lane-change timing tunables
         self.lc_dt = 0.1
@@ -151,6 +157,15 @@ class LaneFollowingNode(Node):
         self.PROMOTE_SAFE_REENTRY_DISTANCE_M = 10.0
         self.REJOIN_DISTANCE_BAND_M = (10.0, 18.0)
         self.MAX_LATERAL_OFFSET_M = 1.0
+
+        # Auto scenario trigger on a designated straight segment.
+        self.auto_scenario_enabled = True
+        self.auto_trigger_center_x = -9.2
+        self.auto_trigger_center_y = -93.3
+        self.auto_trigger_half_x_m = 3.0
+        self.auto_trigger_half_y_m = 12.0
+        self.auto_trigger_latched = False
+        self.auto_next_direction = 'left'
         
         # CARLA Actor 정보 저장
         self.carla_actors = {}
@@ -188,6 +203,53 @@ class LaneFollowingNode(Node):
         msg = Int32MultiArray()
         msg.data = list(self.truck_order)
         self.order_publisher.publish(msg)
+
+    def _start_maneuver_timer(self):
+        self.maneuver_start_time = time.monotonic()
+
+    def _publish_maneuver_metrics(self):
+        elapsed = 0.0
+        if self.maneuver_start_time is not None and self.maneuver_state != ManeuverState.IDLE:
+            elapsed = max(0.0, time.monotonic() - self.maneuver_start_time)
+
+        elapsed_msg = Float32()
+        elapsed_msg.data = float(elapsed)
+        self.maneuver_elapsed_publisher.publish(elapsed_msg)
+
+        duration_msg = Float32()
+        duration_msg.data = float(self.last_maneuver_duration_sec)
+        self.maneuver_last_duration_publisher.publish(duration_msg)
+
+    def _is_in_auto_trigger_zone(self, location) -> bool:
+        return (
+            abs(float(location.x) - self.auto_trigger_center_x) <= self.auto_trigger_half_x_m
+            and abs(float(location.y) - self.auto_trigger_center_y) <= self.auto_trigger_half_y_m
+        )
+
+    def _maybe_trigger_auto_scenario(self):
+        leader_id = self.truck_order[0] if self.truck_order else None
+        leader_tf = self.get_vehicle_transform(leader_id) if leader_id is not None else None
+        if leader_tf is None:
+            return
+
+        in_zone = self._is_in_auto_trigger_zone(leader_tf.location)
+        if not in_zone:
+            self.auto_trigger_latched = False
+            return
+
+        if self.auto_trigger_latched:
+            return
+
+        if not self.auto_scenario_enabled or self.maneuver_state != ManeuverState.IDLE:
+            return
+
+        direction = self.auto_next_direction
+        if self.start_reorder_maneuver(direction):
+            self.auto_trigger_latched = True
+            self.auto_next_direction = 'right' if direction == 'left' else 'left'
+            self.get_logger().info(
+                f"Auto scenario triggered at ({leader_tf.location.x:.1f}, {leader_tf.location.y:.1f}) -> {direction}"
+            )
 
     def get_vehicle_waypoint(self, truck_id):
         actor = self.carla_actors.get(truck_id)
@@ -631,6 +693,7 @@ class LaneFollowingNode(Node):
         self.successor_id = self.truck_order[1]
         self.follower_id = self.truck_order[2]
         self.maneuver_state = ManeuverState.LEADER_EXITS_LANE
+        self._start_maneuver_timer()
         self.get_logger().info(f"= 재배치 시작({direction}) : 리더 {self.exiting_leader_id} 차선이탈 =")
         self.change_lane(self.exiting_leader_id, self.reorder_direction)
         return True
@@ -647,6 +710,7 @@ class LaneFollowingNode(Node):
         self.promote_target_id = target_id
         self.promote_original_leader_id = self.truck_order[0]
         self.maneuver_state = ManeuverState.PROMOTE_TARGET_EXITS
+        self._start_maneuver_timer()
         self.get_logger().info(f"= Promote 시작({direction}) : 타겟 차량 {self.promote_target_id} 차선 이탈 =")
         self.change_lane(self.promote_target_id, self.reorder_direction)
         return True
@@ -798,6 +862,12 @@ class LaneFollowingNode(Node):
 
         self._publish_truck_order()
 
+        if self.maneuver_start_time is not None:
+            self.last_maneuver_duration_sec = max(0.0, time.monotonic() - self.maneuver_start_time)
+            self.maneuver_start_time = None
+            self.get_logger().info(f"기동 완료 시간: {self.last_maneuver_duration_sec:.2f}s")
+            self._publish_maneuver_metrics()
+
         for i in range(3):
             self.reset_lane_state(i)
             pm = self.platooning_manager[i]
@@ -818,6 +888,7 @@ class LaneFollowingNode(Node):
         self.follower_id = -1
         self.promote_target_id = -1
         self.promote_original_leader_id = -1
+        self._publish_maneuver_metrics()
 
     def publish_commands_from_module(self):
         if not self.truck_order: return
