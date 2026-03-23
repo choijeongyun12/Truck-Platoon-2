@@ -104,8 +104,8 @@ class LaneFollowingNode(Node):
         self.waypoint_pass_radius_m = 1.5
         self.waypoint_route_rebuild_min_m = 10.0
         self.waypoint_lookahead_min = 4.0
-        self.waypoint_lookahead_max = 15.0
-        self.waypoint_lookahead_gain = 0.35
+        self.waypoint_lookahead_max = 8.0
+        self.waypoint_lookahead_gain = 0.2
         self.waypoint_lane_width_m = 3.5
         self.waypoint_cte_weight = 1.0
         self.waypoint_heading_weight = 1.2
@@ -326,6 +326,7 @@ class LaneFollowingNode(Node):
                 return route[idx]
 
         return route[-1]
+
 
     def _resolve_target_waypoint(self, truck_id):
         transform = self.get_vehicle_transform(truck_id)
@@ -860,7 +861,7 @@ class LaneFollowingNode(Node):
                     elif leader_front_distance < 30.0:
                         ratio = (leader_front_distance - 10.0) / 20.0
                         final_target_velocity = max(0.0, self.target_velocity * ratio)
-                
+
                 if truck_id == self.exiting_leader_id and self.maneuver_state in (ManeuverState.LEADER_CREATES_GAP, ManeuverState.SUCCESSOR_ENTERS_GAP, ManeuverState.FOLLOWER_ENTERS_GAP):
                     final_target_velocity = min(final_target_velocity, self.target_velocity * self.leader_slow_factor)
 
@@ -870,7 +871,17 @@ class LaneFollowingNode(Node):
                 if leading_distance is None or leading_distance > 40.0:
                     publish_commands([self.throttle_publishers[truck_id]], [self.current_velocities.get(truck_id, 0.0)], self.target_velocity, [self.last_steering.get(truck_id, 0.0)])
                 else:
-                    self.platooning_manager[truck_id].update_distance(leading_distance, emergency_stop=self.emergency_stop)
+                    # Method 3: 선행 차량 속도 및 본인 속도 전달
+                    leader_id = self.truck_order[i - 1]
+                    leader_vel = self.current_velocities.get(leader_id, self.target_velocity)
+                    ego_vel = self.current_velocities.get(truck_id, 0.0)
+                    
+                    self.platooning_manager[truck_id].update_distance(
+                        leading_distance, 
+                        leader_vel, 
+                        emergency_stop=self.emergency_stop,
+                        ego_velocity=ego_vel
+                    )
 
 def opencv_loop(node: LaneFollowingNode):
     window_name = "Combined Bird-Eye View"

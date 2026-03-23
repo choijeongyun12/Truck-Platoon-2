@@ -28,7 +28,7 @@ class TruckState:
     grade_deg: float = 0.0
     model_accel_ms2: float = 0.0
     prev_velocity_ms: Optional[float] = None
-    soc: float = 80.0
+    soc: float = 100.0
     energy_wh: float = 0.0
     distance_m: float = 0.0
     wh_per_km: float = 0.0
@@ -52,7 +52,7 @@ class EnergySocBridgeNode(Node):
         self.declare_parameter("regen_efficiency", 0.70)
         self.declare_parameter("aux_power_w", 3000.0)
         self.declare_parameter("battery_capacity_kwh", 450.0)
-        self.declare_parameter("initial_soc", 80.0)
+        self.declare_parameter("initial_soc", 100.0)
         self.declare_parameter("platoon_order_topic", "/platoon_order")
         self.declare_parameter("aero_drag_multipliers", [1.0, 0.75, 0.85])
         self.declare_parameter("use_pose_grade", True)

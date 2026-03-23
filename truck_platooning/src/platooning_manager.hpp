@@ -26,9 +26,9 @@ public:
             "/" + namespace_ + "/throttle_control", 10);
     }
 
-    void update_distance(float lidar_distance, bool emergency_stop = false) {
+    void update_distance(float lidar_distance, float leader_velocity, bool emergency_stop = false, float ego_velocity = 0.0f) {
         lidar_distance_ = lidar_distance;
-        control_speed(emergency_stop);
+        control_speed(leader_velocity, emergency_stop, ego_velocity);
     }
 
     float integral_;
@@ -36,7 +36,7 @@ public:
     rclcpp::Time prev_time_;
 
 private:
-    void control_speed(bool emergency_stop = false) {
+    void control_speed(float leader_velocity, bool emergency_stop = false, float ego_velocity = 0.0f) {
         if (emergency_stop) {
             std_msgs::msg::Float32 msg;
             msg.data = -1.0f;
@@ -45,18 +45,32 @@ private:
         }
 
         if (!lidar_distance_.has_value()) {
-            RCLCPP_WARN(node_->get_logger(), "[%s] LiDAR 거리 정보 없음, 제어 수행 불가", namespace_.c_str());
             return;
         }
 
         const rclcpp::Time current_time = node_->get_clock()->now();
         double dt = (current_time - prev_time_).seconds();
-        if (dt <= 0.0) dt = 1.0;
+        if (dt <= 0.0) dt = 0.05;
 
+        // 1. 거리 오차 기반 속도 보정치 계산 (PID)
         const float distance_error = *lidar_distance_ - target_distance_;
         integral_ += distance_error * static_cast<float>(dt);
         const float derivative = (distance_error - prev_error_) / static_cast<float>(dt);
-        float speed_command = kp_ * distance_error + ki_ * integral_ + kd_ * derivative;
+        
+        // 거리 유지를 위한 보정 속도 (m/s)
+        float dist_correction = 0.5f * distance_error + 0.01f * integral_ + 0.1f * derivative;
+
+        // 2. 최종 목표 속도 = 선행 차량 속도 + 거리 보정 속도
+        float target_velocity = leader_velocity + dist_correction;
+
+        // 3. 목표 속도 추종을 위한 스로틀 계산 (P 제어)
+        float speed_command;
+        if (ego_velocity > 0.1f || leader_velocity > 0.1f) {
+            float vel_error = target_velocity - ego_velocity;
+            speed_command = vel_error * 0.4f;
+        } else {
+            speed_command = dist_correction * 0.2f;
+        }
 
         if (*lidar_distance_ < safe_distance_) {
             speed_command = -1.0f;

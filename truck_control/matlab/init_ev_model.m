@@ -1,7 +1,7 @@
 function state = init_ev_model(initial_soc)
 %INIT_EV_MODEL Initialize state for EV battery estimation loop.
 if nargin < 1
-    initial_soc = 80.0;
+    initial_soc = 100.0;
 end
 
 state.soc = initial_soc;

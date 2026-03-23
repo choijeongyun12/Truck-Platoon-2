@@ -1,6 +1,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "std_msgs/msg/float32.hpp"
+#include "std_msgs/msg/int32_multi_array.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -73,6 +74,7 @@ public:
         const auto qos_pose =
             rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data)).best_effort();
 
+        order_publisher_ = create_publisher<std_msgs::msg::Int32MultiArray>("/platoon_order", 10);
         for (int i = 0; i < 3; ++i) {
             const std::string ns = "truck" + std::to_string(i);
             steer_publishers_[i] = create_publisher<std_msgs::msg::Float32>("/" + ns + "/steer_control", 10);
@@ -121,6 +123,7 @@ public:
             std::bind(&LaneFollowingNode::processChangeQueue, this));
         control_timer_ = create_wall_timer(50ms, std::bind(&LaneFollowingNode::publishCommandsFromModule, this));
         maneuver_timer_ = create_wall_timer(200ms, std::bind(&LaneFollowingNode::manageReorderManeuver, this));
+        publishTruckOrder();
     }
 
     void enqueueCommand(const PendingCommand &command) {
@@ -165,6 +168,13 @@ private:
             stateName(next),
             reason.c_str());
         maneuver_state_ = next;
+    }
+
+    void publishTruckOrder() {
+        if (!order_publisher_) return;
+        std_msgs::msg::Int32MultiArray msg;
+        msg.data.assign(truck_order_.begin(), truck_order_.end());
+        order_publisher_->publish(msg);
     }
 
     cv::Mat decodeColorImage(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
@@ -638,6 +648,7 @@ private:
             RCLCPP_INFO(get_logger(), "= Promote 완료: 새로운 순서는 [%d, %d, %d] =", truck_order_[0], truck_order_[1], truck_order_[2]);
         }
 
+        publishTruckOrder();
         setManeuverState(ManeuverState::COOLDOWN, "finalized");
         auto holder = std::make_shared<rclcpp::TimerBase::SharedPtr>();
         *holder = create_wall_timer(
@@ -722,7 +733,10 @@ private:
                 if (!lidar_distance || *lidar_distance > loss_dist_) {
                     publish_commands({throttle_publishers_[truck_id]}, {current_velocities_[truck_id]}, target_velocity_, {last_steering_[truck_id]});
                 } else {
-                    platooning_managers_[truck_id]->update_distance(*lidar_distance, emergency_stop_);
+                    const int leader_id = truck_order_[i - 1];
+                    const float leader_vel = current_velocities_[leader_id];
+                    const float ego_vel = current_velocities_[truck_id];
+                    platooning_managers_[truck_id]->update_distance(*lidar_distance, leader_vel, emergency_stop_, ego_vel);
                 }
             }
         }
@@ -762,6 +776,7 @@ private:
 
     std::array<rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr, 3> steer_publishers_;
     std::array<rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr, 3> throttle_publishers_;
+    rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr order_publisher_;
     std::array<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr, 3> camera_subscribers_;
     std::array<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr, 3> ss_subscribers_;
     std::array<rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr, 3> velocity_subscribers_;

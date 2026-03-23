@@ -13,6 +13,7 @@ p_wheel = f_total * v_ms;
 if p_wheel >= 0
     p_batt_w = p_wheel / max(eta_drive, 0.05) + p_aux_w;
 else
-    p_batt_w = p_wheel * min(max(eta_regen, 0.0), 1.0) + p_aux_w;
+    % Regen disabled: decel energy is dumped in friction braking, battery only feeds auxiliaries.
+    p_batt_w = p_aux_w;
 end
 end

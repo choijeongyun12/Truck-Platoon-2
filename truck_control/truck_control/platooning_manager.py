@@ -26,8 +26,8 @@ class PlatooningManager:
         # PID 제어 파라미터
         self.min_distance = 5.0      # 정지 시 최소 간격 (m)
         self.time_gap = 0.8          # 시간 간격 (s)
-        self.target_distance = 5.0  # 동적 계산 전 기본값 (m)
-        self.safe_distance = 4.5     # 최소 안전 간격 (m) 이하이면 저속 혹은 정지
+        self.target_distance = 3.0  # 동적 계산 전 기본값 (m)
+        self.safe_distance = 2.5     # 최소 안전 간격 (m) 이하이면 저속 혹은 정지
         self.kp = 0.3
         self.ki = 0.01
         self.kd = 1.8
@@ -48,56 +48,62 @@ class PlatooningManager:
         self.lidar_pitch = lidar_msg.pitch
         self.control_speed()
 
-    def update_distance(self, lidar_distance, emergency_stop=False, ego_velocity=None,
-                        min_distance_override=None, time_gap_override=None):
+    def update_distance(self, lidar_distance, leader_velocity, emergency_stop=False, ego_velocity=None):
         self.lidar_distance = lidar_distance
+        # 목표 거리 설정 (고정 12m 또는 동적 거리)
         if ego_velocity is not None:
-            min_dist = self.min_distance if min_distance_override is None else float(min_distance_override)
-            time_gap = self.time_gap if time_gap_override is None else float(time_gap_override)
-            self.target_distance = max(min_dist, min_dist + time_gap * float(ego_velocity))
-        self.control_speed(emergency_stop=emergency_stop)  # ✅ 전달값 그대로 사용
+            self.target_distance = max(self.min_distance, self.min_distance + self.time_gap * float(ego_velocity))
+        else:
+            self.target_distance = 12.0  # 기본 목표 거리 12m로 설정
 
-    def control_speed(self, emergency_stop=False):
+        self.control_speed(leader_velocity, emergency_stop=emergency_stop, ego_velocity=ego_velocity)
 
+    def control_speed(self, leader_velocity, emergency_stop=False, ego_velocity=None):
         if emergency_stop:
             self.node.get_logger().info(f"[{self.namespace}] 비상 정지")
             throttle_msg = Float32()
             throttle_msg.data = -1.0
             self.throttle_pub.publish(throttle_msg)
             return
-        """
-        V2V와 LiDAR(거리, pitch) 데이터를 결합하여 PID 제어를 수행하고,
-        목표 간격을 유지하기 위한 스로틀 명령을 계산하여 퍼블리시합니다.
-        """
+
         if self.lidar_distance is None:
-            self.node.get_logger().warn(f"[{self.namespace}] LiDAR 거리 정보 없음, 제어 수행 불가")
             return
 
         current_time = time.time()
-        dt = current_time - self.prev_time if self.prev_time != 0 else 1.0
+        dt = current_time - self.prev_time if self.prev_time != 0 else 0.05
+        if dt <= 0: dt = 0.05
 
-        # 거리 오차 계산: 측정된 간격과 목표 간격의 차이
+        # 1. 거리 오차 기반 속도 보정치 계산 (PID)
         distance_error = self.lidar_distance - self.target_distance
-
-        # PID 제어: 적분 및 미분 값 계산
         self.integral += distance_error * dt
-        derivative = (distance_error - self.prev_error) / dt if dt > 0 else 0.0
-        pid_correction = (self.kp * distance_error +
-                          self.ki * self.integral +
-                          self.kd * derivative)
+        derivative = (distance_error - self.prev_error) / dt
+        
+        # 거리 유지를 위한 보정 속도 (m/s)
+        # Kp=0.5: 1m 차이당 0.5m/s(1.8km/h) 가감속
+        dist_correction = (0.5 * distance_error +
+                           0.01 * self.integral +
+                           0.1 * derivative)
 
-        # 최종 속도 명령 계산
-        speed_command =  pid_correction
+        # 2. 최종 목표 속도 = 선행 차량 속도 + 거리 보정 속도
+        target_velocity = leader_velocity + dist_correction
+        
+        # 3. 목표 속도 추종을 위한 스로틀 계산 (단순 P 제어)
+        if ego_velocity is not None:
+            vel_error = target_velocity - ego_velocity
+            # 속도 오차 1m/s당 0.2 스로틀 보정
+            speed_command = vel_error * 0.4
+        else:
+            # ego_velocity 없을 경우 기존 방식 fallback (단, 베이스가 선행차 속도이므로 더 안정적)
+            speed_command = dist_correction * 0.2
 
-        # 안전 조건: LiDAR 측정 거리가 안전 간격보다 작으면 정지 혹은 저속 명령
+        # 안전 거리 미만 시 강제 제동
         if self.lidar_distance < self.safe_distance:
             speed_command = -1.0
-        # 스로틀 제한
+            
         speed_command = max(-1.0, min(1.0, speed_command))
 
-        # 스로틀 명령 퍼블리시
         throttle_msg = Float32()
-        throttle_msg.data = speed_command
+        throttle_msg.data = float(speed_command)
         self.throttle_pub.publish(throttle_msg)
 
         self.prev_error = distance_error
